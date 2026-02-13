@@ -1,0 +1,374 @@
+import glob
+import json
+import pickle
+import shutil
+import subprocess
+import time
+from urllib import response
+import cv2
+import ffmpegcv
+import modal
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel
+import boto3
+import uuid
+import os
+import pathlib
+from google import genai
+import numpy as np
+from tqdm import tqdm
+import whisperx
+
+class ProcessVideoRequest(BaseModel):
+     s3_key: str
+
+image = (modal.Image.from_registry(
+    "nvidia/cuda:12.4.0-devel-ubuntu22.04", add_python="3.12")
+    .apt_install(["ffmpeg", "libgl1-mesa-glx", "wget", "libcudnn8", "libcudnn8-dev"])
+    .pip_install_from_requirements("requirements.txt")
+    .run_commands(["mkdir -p /usr/share/fonts/truetype/custom",
+                   "wget -O /usr/share/fonts/truetype/custom/Anton-Regular.ttf https://github.com/google/fonts/raw/main/ofl/anton/Anton-Regular.ttf",
+                   "fc-cache -f -v"])
+    .add_local_dir("asd", "/asd", copy=True))
+
+app = modal.App("ai-podcast-clipper", image=image)
+
+volume = modal.Volume.from_name("ai-podcast-clipper-model-cache", create_if_missing=True)
+
+mount_path = "/root/.cache/torch"
+auth_scheme = HTTPBearer()
+
+
+def create_vertical_video(tracks, scores, pyframes_path, pyavi_path, audio_path, output_path, framerate=25):
+     target_width = 1080
+     target_height = 1920
+
+     flist = glob.glob(os.path.join(pyframes_path, "*.jpg"))
+     flist.sort()
+
+     faces = [[] for _ in range(len(flist))]
+
+     for tidx, track in enumerate(tracks):
+          score_array = scores[tidx]
+          for fidx, frame in enumerate(track["track"]["frame"].tolist()):
+               slice_start = max(fidx - 30, 0)
+               slice_end = min(fidx + 30, len(score_array))
+               score_slice = score_array[slice_start:slice_end]
+               avg_score = float(np.mean(score_slice)
+                                   if len(score_slice) > 0 else 0)
+
+               faces[frame].append(
+                    {'track': tidx, 'score': avg_score, 's': track['proc_track']["s"][fidx], 'x': track['proc_track']["x"][fidx], 'y': track['proc_track']["y"][fidx]})
+
+     temp_video_path = os.path.join(pyavi_path, "video_only.mp4")
+
+     vout = None
+
+     for fidx, fname in tqdm(enumerate(flist), total=len(flist), desc="Processing frames for vertical video"):
+          img = cv2.imread(fname)
+          if img is None:
+               continue
+          
+          current_faces = faces[fidx]
+          max_score_face = max(current_faces, key=lambda x: x['score']) if current_faces else None
+
+          if max_score_face and max_score_face['score'] < 0:
+               max_score_face = None
+          
+          if vout is None:
+               vout = ffmpegcv.VideoWriter(file=temp_video_path, 
+                                           codec=None, 
+                                           fps=framerate, 
+                                           resize=(target_width, target_height))
+          if max_score_face:
+               mode = "crop"
+          else:
+               mode = "resize"
+          
+          if mode == "resize":
+               scale = target_width / img.shape[1]
+               resized_height = int(img.shape[0] * scale)
+               resized_img = cv2.resize(img, (target_width, resized_height), interpolation=cv2.INTER_AREA)
+
+               scale_for_bg = max(target_width / img.shape[1], target_height / img.shape[0])
+
+               bg_width = int(img.shape[1] * scale_for_bg)
+               bg_height = int(img.shape[0] * scale_for_bg)
+
+               blurred_background = cv2.resize(img, (bg_width, bg_height))
+               blurred_background = cv2.GaussianBlur(blurred_background, (121, 121), sigmaX=0)
+
+               crop_x = (bg_width - target_width) // 2
+               crop_y = (bg_height - target_height) // 2
+               blurred_background = blurred_background[crop_y:crop_y + target_height, crop_x:crop_x + target_width]
+
+               center_y = (target_height - resized_height) // 2
+               blurred_background[center_y:center_y + resized_height, :] = resized_img
+
+               vout.write(blurred_background)
+          elif mode == "crop":
+               scale = target_height / img.shape[0]
+               resized_img = cv2.resize(img, None, fx= scale, fy=scale, interpolation=cv2.INTER_AREA)
+               frame_width = resized_img.shape[1]
+
+               center_x = int(max_score_face['x'] * scale if max_score_face else frame_width // 2)
+
+               topx = max(min(center_x - target_width // 2, frame_width - target_width), 0)
+
+               image_cropped = resized_img[0:target_height, topx:topx + target_width]
+
+               vout.write(image_cropped)
+          
+     if vout:
+          vout.release()
+     
+     ffmpeg_command = (f"ffmpeg -y -i {temp_video_path} -i {audio_path} "
+                       f"-c:v h264 -preset fast -crf 23 -c:a aac -b:a 192k {output_path}")
+     
+     subprocess.run(ffmpeg_command, shell=True, check=True, text=True)
+
+#### left off at 2:27:18
+
+
+
+
+          
+
+
+def process_clip(base_dir: str, video_path: str, s3_key: str, start_time: float, end_time: float, index: int, transcript_segments: list):
+     clip_name = f"clip_{index + 1}"
+     s3_key_dir = os.path.dirname(s3_key)
+
+     output_s3_key = f"{s3_key_dir}/{clip_name}.mp4"
+     print(f"Output S3 key for clip: {output_s3_key}")
+
+     clip_dir = base_dir / clip_name
+     clip_dir.mkdir(parents=True, exist_ok=True)
+
+     # Segment path original clip from start to end
+
+     clip_segment_path = clip_dir / f"{clip_name}_segment.mp4"
+     vertical_mp4_path = clip_dir / "pyavi" / "video_out_vertical.mp4"
+     subtitle_output_path = clip_dir / "pyavi" / "video_with_subtitles.mp4"
+
+     (clip_dir / "pywork").mkdir(exist_ok=True)
+     py_frames_path = clip_dir / "pyframes"
+     pyavi_path = clip_dir / "pyavi"
+     audio_path = clip_dir / "pyavi" / "audio.wav"
+
+     py_frames_path.mkdir(exist_ok=True)
+     pyavi_path.mkdir(exist_ok=True)
+
+     duration = end_time - start_time
+     cut_command = (f"ffmpeg -i {video_path} -ss {start_time} -t {duration} "  f"{clip_segment_path}")
+     subprocess.run(cut_command, shell=True, check=True, capture_output=True, text=True)
+
+     extract_audio_command = f"ffmpeg -i {clip_segment_path} -vn -acodec pcm_s16le -ar 16000 -ac 1 {audio_path}"
+     subprocess.run(extract_audio_command, shell=True, check=True, capture_output=True, text=True)
+
+     shutil.copy(clip_segment_path, base_dir / f"{clip_name}.mp4")
+
+     columbia_command = (f"python Columbia_test.py --videoName {clip_name} "
+                         f"--videoFolder {str(base_dir)} "
+                         f"--pretrainModel weight/finetuning_TalkSet.model")
+     
+     columbia_start_time = time.time()
+     subprocess.run(columbia_command, cwd="/asd", shell=True)
+     columbia_end_time = time.time()
+     print(f"Columbia processing completed in {columbia_end_time - columbia_start_time:.2f} seconds")
+
+     tracks_path = clip_dir / "pywork" / "tracks.pckl"
+     scores_path = clip_dir / "pywork" / "scores.pckl"
+     if not tracks_path.exists() or not scores_path.exists():
+          raise FileNotFoundError(f"Columbia output files not found: {tracks_path}, {scores_path}")
+
+     with open(tracks_path, "rb") as f:
+          tracks = pickle.load(f)
+
+     with open(scores_path, "rb") as f:
+          scores = pickle.load(f)
+
+     cvv_start_time = time.time()
+     create_vertical_video(tracks, scores, py_frames_path, pyavi_path, audio_path, vertical_mp4_path)
+     cvv_end_time = time.time()
+     print(f"Vertical video creation completed in {cvv_end_time - cvv_start_time:.2f} seconds")
+
+     s3_client = boto3.client("s3")
+     s3_client.upload_file((vertical_mp4_path), "ai-clipper-jx", output_s3_key)
+
+
+
+
+
+
+@app.cls(gpu="L40S", timeout=900, retries = 0, scaledown_window=20, secrets = [modal.Secret.from_name("ai-podcast-clipper-secret")], volumes={mount_path: volume})
+class AiPodcastClipper:
+    @modal.enter()
+    def load_model(self):
+        self.whisperx_model = whisperx.load_model("large-v2", device="cuda", compute_type="float16")
+        self.alignment_mode, self.metadata = whisperx.load_align_model(
+             language_code="en",
+             device="cuda"
+        )
+
+        print("creating gemini client...")
+        self.gemini_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        print("gemini client created")
+
+     
+    def transcribe_video(self, base_dir: str, video_path: str) -> str:
+          # Placeholder for transcription logic
+          audio_path = base_dir / "audio.wav"
+          extract_cmd = f"ffmpeg -i {video_path} -vn -acodec pcm_s16le -ar 16000 -ac 1 {audio_path}"
+
+          subprocess.run(extract_cmd, shell=True, check=True, capture_output=True)
+
+          print("Starting transcription with WhisperX...")
+          start_time = time.time()
+
+
+          audio = whisperx.load_audio(str(audio_path))
+          result = self.whisperx_model.transcribe(audio, batch_size=16)
+
+          result = whisperx.align(result["segments"], 
+                                  self.alignment_mode, 
+                                  self.metadata, 
+                                  audio, 
+                                  device="cuda",
+                                  return_char_alignments=False)
+
+          duration = time.time() - start_time
+          print(f"Transcription and alignment completed in {duration:.2f} seconds")
+
+          # print(json.dumps(result, indent=2))
+
+          # segments = []
+
+          # if "word_segments" in result:
+          #           for word_segment in result["word_segments"]:
+          #                segments.append({
+          #                     "start": word_segment["start"],
+          #                     "end": word_segment["end"],
+          #                     "word": word_segment["word"],
+          #                })
+
+          # return json.dumps(segments)
+
+          segments = []
+
+          # WhisperX align returns segments with words inside them
+          if "segments" in result:
+               for segment in result["segments"]:
+                    if "words" in segment:
+                         for word in segment["words"]:
+                              # Skip words without proper timestamps
+                              if "start" in word and "end" in word and "word" in word:
+                                   segments.append({
+                                   "start": word["start"],
+                                   "end": word["end"],
+                                   "word": word["word"],
+                                   })
+                              else:
+                                   print(f"Skipping word without timestamps: {word}")
+
+          print(f"Extracted {len(segments)} words with timestamps")
+          return json.dumps(segments)
+               
+
+    ##### We can come back and change this later so that the user may input custom instructions
+    def identify_moments(self, transcript: dict):
+         response = self.gemini_client.models.generate_content(model="gemini-2.5-flash", contents="""
+    This is a podcast video transcript consisting of word, along with each words's start and end time. I am looking to create clips between a minimum of 30 and maximum of 60 seconds long. The clip should never exceed 60 seconds.
+
+    Your task is to find and extract stories, or question and their corresponding answers from the transcript.
+    Each clip should begin with the question and conclude with the answer.
+    It is acceptable for the clip to include a few additional sentences before a question if it aids in contextualizing the question.
+
+    Please adhere to the following rules:
+    - Ensure that clips do not overlap with one another.
+    - Start and end timestamps of the clips should align perfectly with the sentence boundaries in the transcript.
+    - Only use the start and end timestamps provided in the input. modifying timestamps is not allowed.
+    - Format the output as a list of JSON objects, each representing a clip with 'start' and 'end' timestamps: [{"start": seconds, "end": seconds}, ...clip2, clip3]. The output should always be readable by the python json.loads function.
+    - Aim to generate longer clips between 40-60 seconds, and ensure to include as much content from the context as viable.
+
+    Avoid including:
+    - Moments of greeting, thanking, or saying goodbye.
+    - Non-question and answer interactions.
+
+    If there are no valid clips to extract, the output should be an empty list [], in JSON format. Also readable by json.loads() in Python.
+
+    The transcript is as follows:\n\n""" + str(transcript))
+         print(f"Identified moments response: ${response.text}")
+         return response.text
+    
+          
+
+    @modal.fastapi_endpoint(method="POST")
+    def process_video(self, request: ProcessVideoRequest, token: HTTPAuthorizationCredentials = Depends(auth_scheme)):
+         s3_key = request.s3_key
+     
+         if token.credentials != os.environ["AUTH_TOKEN"]:
+              raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect bearer token", headers = {"WWW-Authenticate": "Bearer"})
+         
+         run_id = str(uuid.uuid4())
+         base_dir = pathlib.Path("/tmp") / run_id
+         base_dir.mkdir(parents=True, exist_ok=True)
+
+         video_path = base_dir / "input_video.mp4"
+         s3_client = boto3.client("s3")
+         s3_client.download_file("ai-clipper-jx", s3_key, str(video_path))
+
+          #### transcription
+         transcript_segments_json = self.transcribe_video(base_dir, video_path)
+         transcript_segments = json.loads(transcript_segments_json)
+
+
+         # 2. identify moments for clips
+         identified_moments_raw = self.identify_moments(transcript_segments)
+         cleaning_json_string = identified_moments_raw.strip()
+         if cleaning_json_string.startswith("```json"):
+              cleaned_json_string = cleaning_json_string[len("```json"):].strip()
+         if cleaned_json_string.endswith("```"):
+              cleaned_json_string = cleaned_json_string[:-len("```")].strip()
+         clip_moments = json.loads(cleaned_json_string)
+         if not clip_moments or not isinstance(clip_moments, list):
+              clip_moments = []
+              raise ValueError("Identified moments response is not a list of clips")
+         print(clip_moments)
+
+
+         # 3. Process clips
+         for index, moment in enumerate(clip_moments[:1]):
+              if "start" in moment and "end" in moment:
+                   print(f"Clipping moment {index + 1}: start={moment['start']}s, end={moment['end']}s")
+                   process_clip(base_dir, video_path, s3_key, moment["start"], moment["end"], index, transcript_segments)
+         
+         print(os.listdir(base_dir))
+
+         if base_dir.exists():
+              print(f"Cleaning up temporary files in {base_dir}...")
+              shutil.rmtree(base_dir, ignore_errors=True)
+
+
+
+         print("Processing video..." + request.s3_key)
+@app.local_entrypoint()
+def main():
+     import requests
+
+     ai_podcast_clipper = AiPodcastClipper()
+     url = ai_podcast_clipper.process_video.web_url
+     payload = {
+          "s3_key": "test1/mi65min.mp4"
+     }
+
+     headers = {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer 123123"
+     }
+
+     response = requests.post(url, json=payload, headers=headers)
+     response.raise_for_status()
+     result = response.json()
+     print("Response:", result)
