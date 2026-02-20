@@ -1,2 +1,60 @@
-ai-backend/mi6.mp4
-ai-backend/mi65min.mp4
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Log files
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Temporary files
+*.tmp
+*.swp
+*.swo
+*.swn
+
+# Editor directories and files
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.sublime-workspace
+
+# Media files (too large!)
+*.mp4
+*.mov
+*.avi
+*.mkv
+
+# Frontend (Next.js) - Use wildcards to catch any folder name
+**/node_modules/
+**/.next/
+**/out/
+**/.env
+**/.env*.local
+**/*.tsbuildinfo
+**/next-env.d.ts
+
+# Backend (Python/Modal) - Use wildcards to catch any folder name
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/.venv/
+**/venv/
+**/env/
+**/.modal*
+
+# Database files
+*.db
+*.db-journal
+*.sqlite
+
+# Specific files you want to ignore
+brca1_analysis_plot.png
+
+**/generated/
