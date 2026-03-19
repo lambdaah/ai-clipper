@@ -35,7 +35,7 @@ export function SignupForm({
 
             const result = await signUp(data);
             if (!result.success){
-              setError(result.error || "An error occured during signup")
+              setError(result.error ?? "An error occured during signup")
               return;
             }
 
